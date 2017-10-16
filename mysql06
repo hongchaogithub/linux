@@ -1,0 +1,321 @@
+逻辑卷实现mysql备份：
+思路：
+1、当前的mysql数据库必须在逻辑卷上
+2、给mysql数据库所在逻辑卷创建快照
+3、通过快照实现对mysql数据库的备份
+
+步骤：
+1、添加一块设备并且创建逻辑卷（可选）
+  776  lsblk 
+  777  pvcreate /dev/sdb
+  778  vgcreate vg01 /dev/sdb
+  779  vgs
+  780  lvcreate -n lv-mysql -L 8G vg01
+  781  lvs
+  788  mkfs.ext4 /dev/mapper/vg01-lv--mysql 
+  789  mkdir /mysql-tmp   创建一个临时目录用来存放数据文件
+2、将现有mysql数据库迁移到逻辑卷上（可选）
+1> 停业务停服务
+service httpd stop
+service mysql stop
+2> 将mysql数据文件迁移到一个临时目录
+  790  rsync -av /var/lib/mysql/ /mysql-tmp/  同步数据文件到该临时目录
+3> 挂载逻辑卷到/var/lib/mysql并开机自动挂载
+  792  mount /dev/vg01/lv-mysql /var/lib/mysql/
+4> 将临时目录里的数据文件同步到逻辑卷上
+798  rsync -av /mysql-tmp/ /var/lib/mysql/
+5> 启动数据库
+service mysql start
+
+3、锁表
+flush table with read locak;
+4、给mysql数据库所在的逻辑卷创建快照
+  806  dmsetup --tree ls
+  807  lvcreate -n lv-mysql-snp -L 100M -s /dev/vg01/lv-mysql 
+  808  dmsetup --tree ls
+  809  lvs
+
+5、解锁
+unlock tables;
+
+6、将快照挂载到一个临时挂载点上
+819  mount /dev/vg01/lv-mysql-snp /var/tmp/
+
+7、将数据拷贝到指定的备份目录里
+  825  cd /backup/
+  826  ll
+  827  mkdir lvm
+  828  rsync -av /var/tmp/ /backup/lvm/
+
+8、卸载快照并且删除
+  833  umount /var/tmp/
+  834  lvs
+  835  lvremove /dev/vg01/lv-mysql-snp 
+
+
+实例1：使用innobackupex+binlog实现增量备份并恢复演练
+建立myisam存储引擎和innodb存储引擎的表测试：
+开启bin-log日志：
+mysql> create database db02;
+mysql> use db02
+mysql> create table t1(id int,name varchar(10)) engine=myisam;
+mysql> insert into t1 values(1,'mona');
+mysql> create table t2(id int,name varchar(10)) engine=innodb;
+mysql> insert into t2 values(2,'tom');
+
+备份前：
+mysql> select * from t1;
++------+------+
+| id   | name |
++------+------+
+|    1 | mona |
++------+------+
+1 row in set (0.00 sec)
+
+mysql> select * from t2;
++------+------+
+| id   | name |
++------+------+
+|    2 | tom  |
++------+------+
+1 row in set (0.00 sec)
+
+
+步骤：
+1、使用innobackupex工具做全备   类似12：00全备——12：30备份完毕
+# innobackupex --user=root --password=123 /innobackup/
+
+2、对数据库进行更新操作  类似12：30以后对数据库做操作
+mysql> select * from t1;
++------+-------+
+| id   | name  |
++------+-------+
+|    1 | jack  |
+|    2 | harry |
++------+-------+
+2 rows in set (0.00 sec)
+
+mysql> select * from t2;
++------+------+
+| id   | name |
++------+------+
+|    1 | tom  |
+|    3 | uuu  |
++------+------+
+2 rows in set (0.00 sec)
+
+3、备份二进制日志文件
+# cp node1-bin.000006 /opt
+或者
+# cat xtrabackup_binlog_info 
+node1-bin.000006	1059
+
+# mysqlbinlog --start-position=1059 node1-bin.000006 > /innobackup/binlog.sql
+
+4、模拟数据损坏
+rm -rf /var/lib/mysql/*
+
+5、准备恢复
+1> 预备（将已经提交的事务进行前滚，未提交的事务进行回滚）
+# innobackupex --apply-log /innobackup/2017-09-12_14-21-43/
+
+2> 恢复
+# innobackupex --copy-back /innobackup/2017-09-12_14-21-43/
+注意：
+因为是物理层面的恢复（操作系统级别的拷贝），所以不需要mysql数据库起来
+
+3> 检查数据库文件的权限
+[root@node1 mysql]# chown -R mysql. .
+
+4> 启动数据库
+service mysql start
+
+5> 检查数据库 （当前数据库的状态是12：30）
+mysql> select * from t1;
++------+------+
+| id   | name |
++------+------+
+|    1 | mona |
++------+------+
+1 row in set (0.00 sec)
+
+mysql> select * from t2;
++------+------+
+| id   | name |
++------+------+
+|    2 | tom  |
++------+------+
+1 row in set (0.00 sec)
+
+6> 结合二进制日志将数据库恢复到最新状态
+# mysql db02 < /innobackup/binlog.sql -p123
+
+mysql> select * from t1;
++------+-------+
+| id   | name  |
++------+-------+
+|    1 | jack  |
+|    2 | harry |
++------+-------+
+2 rows in set (0.00 sec)
+
+mysql> select * from t2;
++------+------+
+| id   | name |
++------+------+
+|    1 | tom  |
+|    3 | uuu  |
++------+------+
+2 rows in set (0.01 sec)
+
+
+12：00   12：30   13：00   13：15  13：30
+全	 全完毕	   增	   增完毕   崩溃
+
+恢复过程：
+1、预备全备
+2、预备增备
+3、恢复 13:15
+
+12：00   12：30   13：00   13：15   14：00   14：15    14：30
+全	 全完毕	   增1	   增1完毕   增2     增2完毕     崩溃
+
+恢复过程：
+1、预备全备
+2、预备增备1 
+3、预备增备2
+4、恢复 14:15
+
+使用innobackupex工具实现增量备份并且恢复
+步骤：
+1、查看当前数据库的状态并做全量备份   12：00-12：30 全备完毕
+mysql> select * from t1;
++------+-------+
+| id   | name  |
++------+-------+
+|    1 | jack  |
+|    2 | harry |
++------+-------+
+2 rows in set (0.00 sec)
+
+mysql> select * from t2;
++------+------+
+| id   | name |
++------+------+
+|    1 | tom  |
+|    3 | uuu  |
++------+------+
+
+# innobackupex --user=backw --password=123 /innobackup/
+
+2、对数据库做更新操作 12:30以后
+mysql> select * from t1;
++------+-------+
+| id   | name  |
++------+-------+
+|    1 | hello |
+|    2 | hello |
++------+-------+
+2 rows in set (0.00 sec)
+
+mysql> select * from t2;
++------+------+
+| id   | name |
++------+------+
+|    1 | tom  |
+|    3 | uuu  |
+|    2 | yyy  |
++------+------+
+3 rows in set (0.00 sec)
+
+3、做第一次增量备份 13:00-13：15备份完毕
+# innobackupex --incremental /incremental/ --incremental-basedir=/innobackup/2017-09-12_15-14-15/ --user=backw --password=123
+
+
+4、再次对数据库做更新操作 
+mysql> select * from t1;
++------+-------+
+| id   | name  |
++------+-------+
+|    1 | hello |
+|    2 | oooo  |
+|    3 | aaaa  |
+|    4 | bbbb  |
++------+-------+
+4 rows in set (0.00 sec)
+
+mysql> select * from t2;
+Empty set (0.00 sec)
+
+5、做第二次增量备份 14：00-14：15备份完毕
+# innobackupex --incremental /incremental/ --incremental-basedir=/incremental/2017-09-12_15-19-11/ --user=backw --password=123
+
+
+6、再次对数据库做更新 14:15分以后
+mysql> insert into t2 values(1,'rrr');
+Query OK, 1 row affected (0.00 sec)
+
+mysql> select * from t2;
++------+------+
+| id   | name |
++------+------+
+|    1 | rrr  |
++------+------+
+1 row in set (0.00 sec)
+
+mysql> select * from t1;
++------+-------+
+| id   | name  |
++------+-------+
+|    1 | hello |
+|    2 | oooo  |
+|    3 | aaaa  |
+|    4 | bbbb  |
++------+-------+
+4 rows in set (0.00 sec)
+
+7、模拟数据库损坏 14:30
+rm -rf /var/lib/mysql/*
+
+8、恢复
+1> 预备全备
+# innobackupex --apply-log --redo-only /innobackup/2017-09-12_15-14-15/
+可以恢复到12:30
+2> 预备增备1 --redo-only //只应用前滚不回滚
+# innobackupex --apply-log --redo-only /innobackup/2017-09-12_15-14-15/ --incremental-dir=/incremental/2017-09-12_15-19-11/
+可以恢复到13:15
+3> 预备增备2
+# innobackupex --apply-log /innobackup/2017-09-12_15-14-15/ --incremental-dir=/incremental/2017-09-12_15-24-11/
+可以恢复到14:15
+4> 恢复
+# innobackupex --copy-back /innobackup/2017-09-12_15-14-15/
+
+总结：
+innobackupex xtrabackup  重要必须掌握
+1、全量备份
+2、预备（如果是多次增量备份时，前几次只前滚不回滚，最后一次前滚和回滚）
+3、恢复  mysql数据库不需要启动
+
+mysqldump  恢复时mysql数据库必须在启动状态
+
+lvm快照  mysql数据库停止恢复
+
+tar|rsync...
+
+into oufile ...
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,2 +1,3 @@
-# uplooking
-uplooking homework
+# linux 
+linux learning
+
